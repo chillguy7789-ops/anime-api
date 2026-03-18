@@ -1,63 +1,45 @@
 import { Router } from "express";
 import _nodeFetch, { Response as NodeFetchResponse } from "node-fetch";
 import type { RequestInit as NodeFetchRequestInit } from "node-fetch";
+import { HttpsProxyAgent } from "https-proxy-agent";
 import crypto from "crypto";
 import https from "https";
 import http from "http";
 import type { IncomingMessage } from "http";
 
-// ─── Phone proxy support ──────────────────────────────────────────────────────
-// CF_PROXY_URL: URL of the phone proxy (e.g. https://xxx.trycloudflare.com)
-// CF_PROXY_SECRET: shared secret matching PROXY_SECRET on the phone
-//
-// Routes Aniwave/9anime/GogoAnime requests through the phone's residential IP.
-// AllAnime and HiAnime still go direct (they work fine from datacenter).
+// ─── Proxy support ────────────────────────────────────────────────────────────
+// Set PROXY_URL to a residential HTTP/HTTPS proxy (e.g. "http://user:pass@host:port")
+// to route all scraper traffic through it. Required for sites whose CDN blocks
+// datacenter egress (Aniwave, 9anime, GogoAnime all use the same infrastructure).
 
-const CF_PROXY_URL = (process.env.CF_PROXY_URL || '').replace(/\/+$/, '');
-const CF_PROXY_SECRET = process.env.CF_PROXY_SECRET || 'swach-proxy';
+let _cachedProxyAgent: HttpsProxyAgent<string> | undefined;
 
-/**
- * Send a request through the phone proxy.
- * Falls back to direct fetch if no proxy is configured.
- */
-async function cfFetch(
-  url: string,
-  options: { headers?: Record<string, string>; signal?: AbortSignal } = {}
-): Promise<Awaited<ReturnType<typeof _nodeFetch>>> {
-  if (!CF_PROXY_URL) {
-    // No proxy — direct (will likely be blocked by CDN for Aniwave/9anime)
-    return _nodeFetch(url, options as NodeFetchRequestInit);
-  }
-  return _nodeFetch(`${CF_PROXY_URL}/proxy`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'X-Proxy-Token': CF_PROXY_SECRET,
-    },
-    body: JSON.stringify({
-      url,
-      method: 'GET',
-      headers: options.headers || {},
-    }),
-    signal: options.signal,
-  });
+function getProxyAgent(): HttpsProxyAgent<string> | undefined {
+  const proxyUrl = process.env.PROXY_URL;
+  if (!proxyUrl) return undefined;
+  if (!_cachedProxyAgent) _cachedProxyAgent = new HttpsProxyAgent(proxyUrl);
+  return _cachedProxyAgent;
 }
 
-// Standard fetch for AllAnime/HiAnime (datacenter-friendly)
+// Proxy-aware fetch — drop-in replacement for node-fetch.
+// All fetch() calls in this file automatically use PROXY_URL when set.
 function fetch(
   url: Parameters<typeof _nodeFetch>[0],
   options: NodeFetchRequestInit = {}
 ) {
-  return _nodeFetch(url, options);
+  const agent = getProxyAgent();
+  return _nodeFetch(url, agent ? { ...options, agent } : options);
 }
 
-// Compatibility shims (used by tadFetch internals)
-// getProxyAgent shim — no longer used, kept for compatibility
-function getProxyAgent() { return undefined; }
-function getManualProxyAgent() { return undefined; }
-
-
 const router = Router();
+
+// ─── Global CORS — applied to every route including unmatched ones ────────────
+router.use((_req, res, next) => {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Headers", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET,OPTIONS");
+  next();
+});
 
 // ─── Shared result interface ──────────────────────────────────────────────────
 
@@ -594,26 +576,77 @@ async function scrapeAllanime(
 }
 
 // ─── Aniwave ──────────────────────────────────────────────────────────────────
+//
+// Network traffic analysis on aniwave.to reveals the following flow:
+//
+//  Bot protection (FingerprintJS challenge):
+//    Every AJAX request first returns a JS challenge page.
+//    The page sets redirect_link = '<url>?tr_uuid=<uuid>&' then redirects with fp=<fingerprint>.
+//    Using fp=-7 (the timeout fallback) triggers a 302 that:
+//      - Sets cookie __tad (long-lived session token, domain=aniwave.to)
+//      - Redirects to http://wwXX.aniwave.to<path>  (dynamic CDN backend)
+//    The real JSON lives at the wwXX.aniwave.to CDN URL with the __tad cookie.
+//
+//  NOTE: wwXX.aniwave.to CDN IPs block datacenter egress (Render/Replit/AWS/etc.)
+//        at the TCP level. This scraper will work from residential IPs or via a
+//        residential proxy but will time out from cloud datacenter environments.
+//
+//  1. Episode list:  GET /ajax/episode/list/<animeId>
+//     Response: { status: true, result: "<li data-id='<nodeId>' data-num='<num>'>" }
+//
+//  2. Server list:  GET /ajax/episode/servers/<episodeNodeId>
+//     Response: { status: true, result: "<a data-id='<serverNodeId>'
+//                 data-embed-id='<embedId>' data-type='sub|dub' data-title='...'>" }
+//     embedId → Megacloud source ID (call getMegacloudSources directly)
+//
+//  3. Playback info (fallback): GET /ajax/episode/playbackInfo/<serverNodeId>
+//     Response: { status: true, result: { link: "https://megacloud.tv/embed-2/e-1/<id>" } }
+//
+// episodeId format: "<animeId>/<episodeNumber>"  e.g. "12189/1"
 
 const ANIWAVE_BASE = "https://aniwave.to";
 const ANIWAVE_REFERER = `${ANIWAVE_BASE}/`;
 
+// ─── Generic __tad challenge solver ──────────────────────────────────────────
+//
+// Aniwave, 9anime, GogoAnime (gg), and marin.moe all share the same
+// FingerprintJS challenge infrastructure (same Apache server, same __tad cookie,
+// same redirect flow). This generic solver handles all of them.
+//
+// Challenge flow (per request):
+//  1. GET <url>  → HTML with: redirect_link = 'http://<domain><path>?tr_uuid=<uuid>&'
+//  2. GET <redirect_link>fp=-7  → 302:
+//       Set-Cookie: __tad=<token>  (long-lived session cookie)
+//       Location: <cdn_url>         (e.g. http://wwXX.aniwave.to<path>)
+//  3. GET <cdn_url> with Cookie: __tad=<token>  → actual JSON data
+//
+// Note on CDN blocking: wwXX.aniwave.to and similar CDN backends drop TCP
+// connections from datacenter IPs (Render/Replit/AWS). Set PROXY_URL to a
+// residential proxy to bypass this. The fetch() wrapper above handles that.
+
 interface TadSession {
   tadCookie: string;
-  cdnHost: string;
+  cdnHost: string;  // e.g. ww38.aniwave.to
   ts: number;
 }
 
 const tadSessions: Record<string, TadSession> = {};
-const TAD_SESSION_TTL = 30 * 60_000;
+const TAD_SESSION_TTL = 30 * 60_000; // 30 minutes
 
+/**
+ * Solve the __tad FingerprintJS challenge for any URL on a protected site.
+ * Returns the __tad cookie value and the CDN URL to use for the real request.
+ */
 async function solveTadChallenge(
   url: string,
   baseHeaders: Record<string, string>
 ): Promise<{ tadCookie: string; cdnUrl: string }> {
-  const challengeRes = await cfFetch(url, {
+  // Step 1 — fetch the challenge page (manual redirect so we can read the HTML)
+  const challengeRes = await _nodeFetch(url, {
     headers: baseHeaders,
     signal: AbortSignal.timeout(15000),
+    redirect: "manual",
+    agent: getProxyAgent(),
   });
   const html = await challengeRes.text();
 
@@ -625,9 +658,12 @@ async function solveTadChallenge(
   }
   const redirectBase = redirectMatch[1];
 
-  const step2Res = await cfFetch(`${redirectBase}fp=-7`, {
+  // Step 2 — follow the challenge redirect with fp=-7 (the browser timeout fallback)
+  const step2Res = await _nodeFetch(`${redirectBase}fp=-7`, {
     headers: baseHeaders,
     signal: AbortSignal.timeout(15000),
+    redirect: "manual",
+    agent: getProxyAgent(),
   });
 
   const setCookieHeader = step2Res.headers.get("set-cookie") || "";
@@ -645,15 +681,27 @@ async function solveTadChallenge(
   return { tadCookie, cdnUrl: location };
 }
 
+/**
+ * Fetch an AJAX endpoint on any __tad-protected site.
+ *
+ * Strategy (in order):
+ *  1. If we have a valid cached session for this domain, try the CDN URL directly.
+ *  2. Otherwise solve the challenge → get __tad + CDN URL.
+ *  3. If the CDN URL carries the same path (Aniwave case), fetch the CDN URL.
+ *     If the CDN URL is a router/ad redirect (9anime/GogoAnime case), retry the
+ *     original URL with the __tad cookie (works via residential proxy).
+ *  4. Cache the session for future calls.
+ */
 async function tadFetch(
   url: string,
-  siteBase: string,
+  siteBase: string,       // e.g. "https://aniwave.to"
   siteHeaders: Record<string, string>
 ): Promise<Awaited<ReturnType<typeof fetch>>> {
   const parsedUrl = new URL(url);
   const urlPath = parsedUrl.pathname + parsedUrl.search;
   const domain = parsedUrl.hostname;
 
+  // Try cached session
   const cached = tadSessions[domain];
   if (cached && Date.now() - cached.ts < TAD_SESSION_TTL) {
     const cdnUrl = `http://${cached.cdnHost}${urlPath}`;
@@ -664,11 +712,12 @@ async function tadFetch(
       });
       if (res.ok) return res;
     } catch {
-      // fall through
+      // CDN stale or unreachable — fall through to re-challenge
     }
     delete tadSessions[domain];
   }
 
+  // Solve the challenge
   const { tadCookie, cdnUrl } = await solveTadChallenge(url, siteHeaders);
 
   let cdnHost: string;
@@ -682,75 +731,74 @@ async function tadFetch(
     try { return new URL(cdnUrl).pathname; } catch { return ""; }
   })();
 
+  // Check if the CDN URL is actually serving the requested data (path matches)
+  // vs being a router/ad redirect (9anime → a11.click, etc.)
   const isCdnData = cdnPath === parsedUrl.pathname;
 
-  // Helper: attempt the real CDN/site fetch, optionally through an agent
-  const attemptCdnFetch = async (
-    targetUrl: string,
-    headers: Record<string, string>,
-    agent?: Agent
-  ): Promise<Awaited<ReturnType<typeof fetch>>> => {
-    const opts: NodeFetchRequestInit = {
-      headers,
-      signal: AbortSignal.timeout(9000),
-    };
-    if (agent) opts.agent = agent;
-    return _nodeFetch(targetUrl, opts);
-  };
-
-  // Helper: try a fetch first directly, then through proxy pool on failure
-  const fetchWithFallback = async (
-    targetUrl: string,
-    headers: Record<string, string>,
-    label: string
-  ): Promise<Awaited<ReturnType<typeof fetch>>> => {
-    // No manual agent — will use phone proxy on fallback
-
-    // Try direct first (fast path for non-blocked IPs)
+  if (isCdnData) {
+    // CDN host serves the data directly (Aniwave pattern)
+    tadSessions[domain] = { tadCookie, cdnHost, ts: Date.now() };
+    let res: Awaited<ReturnType<typeof fetch>>;
     try {
-      const res = await attemptCdnFetch(targetUrl, headers);
-      const text = await res.text();
-      const looksBlocked =
-        text.includes("redirect_link") ||
-        (!res.headers.get("content-type")?.includes("json") &&
-          (text.trimStart().startsWith("<") || text.includes("<html")));
-      if (!looksBlocked) {
-        return new NodeFetchResponse(text, {
-          status: res.status,
-          headers: res.headers,
-        }) as unknown as Awaited<ReturnType<typeof fetch>>;
-      }
-      console.warn(`[tadFetch] Direct CDN blocked (HTML response) for ${label}, trying proxy pool...`);
-    } catch (directErr) {
-      console.warn(`[tadFetch] Direct CDN unreachable for ${label}: ${String(directErr)}, trying proxy pool...`);
+      res = await fetch(cdnUrl, {
+        headers: { ...siteHeaders, Cookie: tadCookie },
+        signal: AbortSignal.timeout(9000),
+      });
+    } catch (e) {
+      throw new Error(
+        `CDN unreachable (${cdnUrl}): ${String(e)}. ` +
+        `${domain}'s CDN (${cdnHost}) blocks datacenter IPs. ` +
+        `Set PROXY_URL to a residential proxy to bypass this.`
+      );
+    }
+    if (!res.ok) throw new Error(`CDN HTTP ${res.status} from ${cdnUrl}`);
+    return res;
+  } else {
+    // CDN URL is a router/ad (9anime/GogoAnime pattern) — retry original URL
+    // with __tad cookie. Works when PROXY_URL is a residential IP (no challenge shown).
+    // Store cdnHost as the original domain since we're retrying there.
+    tadSessions[domain] = { tadCookie, cdnHost: domain, ts: Date.now() };
+    let res: Awaited<ReturnType<typeof fetch>>;
+    try {
+      res = await fetch(url, {
+        headers: { ...siteHeaders, Cookie: tadCookie },
+        signal: AbortSignal.timeout(9000),
+      });
+    } catch (e) {
+      throw new Error(
+        `${domain} unreachable after challenge: ${String(e)}. ` +
+        `Set PROXY_URL to a residential proxy to bypass CDN IP blocking.`
+      );
+    }
+    // If still a challenge page, proxy is needed
+    const text = await res.text();
+    if (text.includes("redirect_link")) {
+      throw new Error(
+        `${domain} continues to show bot challenge after __tad cookie. ` +
+        `Set PROXY_URL to a residential proxy — datacenter IPs are blocked.`
+      );
+    }
+    // Check if the response is HTML (challenge page, access denied, etc.) rather than JSON data
+    const contentType = res.headers.get("content-type") || "";
+    const looksLikeHtml = !contentType.includes("json") && (
+      text.trimStart().startsWith("<") || text.includes("<html")
+    );
+    if (looksLikeHtml) {
+      throw new Error(
+        `${domain} returned HTML after __tad challenge — datacenter IPs are blocked. ` +
+        `Set PROXY_URL to a residential proxy to bypass this.`
+      );
     }
 
-    // Fall back to phone proxy
-    const res = await cfFetch(targetUrl, { headers });
-    const text = await res.text();
-    const looksBlocked =
-      text.includes("redirect_link") ||
-      (!res.headers.get("content-type")?.includes("json") &&
-        (text.trimStart().startsWith("<") || text.includes("<html")));
-    if (looksBlocked) {
-      throw new Error("phone proxy returned a blocked/HTML response — check tunnel is running");
-    }
+    // Return a synthetic Response with the text body
     return new NodeFetchResponse(text, {
       status: res.status,
       headers: res.headers,
     }) as unknown as Awaited<ReturnType<typeof fetch>>;
-  };
-
-  if (isCdnData) {
-    tadSessions[domain] = { tadCookie, cdnHost, ts: Date.now() };
-    return fetchWithFallback(cdnUrl, { ...siteHeaders, Cookie: tadCookie }, cdnUrl);
-  } else {
-    tadSessions[domain] = { tadCookie, cdnHost: domain, ts: Date.now() };
-    return fetchWithFallback(url, { ...siteHeaders, Cookie: tadCookie }, url);
   }
 }
 
-// ─── Aniwave helpers ──────────────────────────────────────────────────────────
+// ─── Aniwave-specific helpers (thin wrappers over tadFetch) ──────────────────
 
 function aniwaveHeaders(
   extra: Record<string, string> = {},
@@ -780,9 +828,18 @@ interface AniwaveServer {
   title: string;
 }
 
+/**
+ * Parse server list HTML from /ajax/episode/servers/<episodeNodeId>.
+ * Each server is an <a> (or <li><a>) with:
+ *   data-id="<serverNodeId>"
+ *   data-embed-id="<embedId>"
+ *   data-type="sub|dub|raw"
+ *   data-title="Server Name"
+ */
 function parseAniwaveServers(html: string, type: "sub" | "dub"): AniwaveServer[] {
   const servers: AniwaveServer[] = [];
 
+  // Match elements carrying both data-id and data-embed-id
   const re =
     /data-id="([^"]+)"[^>]*?data-embed-id="([^"]+)"[^>]*?data-type="([^"]+)"[^>]*?data-title="([^"]*)"/g;
   const re2 =
@@ -797,6 +854,7 @@ function parseAniwaveServers(html: string, type: "sub" | "dub"): AniwaveServer[]
     }
   }
 
+  // Try alternate attribute order if first pass found nothing
   if (servers.length === 0) {
     while ((m = re2.exec(html)) !== null) {
       const [, embedId, serverNodeId, sType, title] = m;
@@ -809,10 +867,19 @@ function parseAniwaveServers(html: string, type: "sub" | "dub"): AniwaveServer[]
   return servers;
 }
 
+/**
+ * Resolve a single Aniwave server to a StreamResult.
+ *
+ * Strategy:
+ *  1. Use the embedId directly with Megacloud getSources (fastest path — no extra round-trip).
+ *  2. If that 404s, call /ajax/episode/playbackInfo/<serverNodeId> to get the embed link,
+ *     then dispatch based on the returned embed host.
+ */
 async function resolveAniwaveServer(
   server: AniwaveServer,
   referer: string
 ): Promise<Omit<StreamResult, "site"> | null> {
+  // Fast path: try embedId directly against Megacloud e-1
   try {
     const result = await getMegacloudSources(server.embedId);
     if (result.sources.length > 0) {
@@ -839,6 +906,7 @@ async function resolveAniwaveServer(
     // Fall through to playbackInfo route
   }
 
+  // Slow path: fetch playback info to get embed URL
   try {
     const infoRes = await aniwaveFetch(
       `${ANIWAVE_BASE}/ajax/episode/playbackInfo/${server.serverNodeId}`,
@@ -874,6 +942,7 @@ async function resolveAniwaveServer(
       result = await getRapidCloudSources(idMatch[1], embedLink);
       serverName = server.title || "rapidcloud";
     } else {
+      // Unknown embed host — return as iframe
       return {
         url: embedLink,
         type: "iframe",
@@ -910,6 +979,22 @@ async function resolveAniwaveServer(
   }
 }
 
+/**
+ * scrapeAniwave(episodeId, type)
+ *
+ * episodeId format:  "<animeId>/<episodeNumber>"
+ *   e.g. "12189/1"
+ *
+ * The animeId is the numeric ID found in data-id attributes on the aniwave.to
+ * anime listing pages (also appears in the URL path of individual anime pages
+ * like https://aniwave.to/watch/one-piece.12189).
+ *
+ * Waterfall:
+ *  1. GET /ajax/episode/list/<animeId>  — find the episode node for the given number
+ *  2. GET /ajax/episode/servers/<episodeNodeId> — list servers filtered by type
+ *  3. For each server, attempt getMegacloudSources(embedId) directly, then fall
+ *     back to /ajax/episode/playbackInfo/<serverNodeId> if needed.
+ */
 async function scrapeAniwave(
   episodeId: string,
   type: "sub" | "dub"
@@ -924,6 +1009,7 @@ async function scrapeAniwave(
   const animeId = episodeId.slice(0, slashIdx);
   const episodeNumber = episodeId.slice(slashIdx + 1);
 
+  // 1. Fetch episode list
   const listRes = await aniwaveFetch(
     `${ANIWAVE_BASE}/ajax/episode/list/${animeId}`
   );
@@ -933,6 +1019,8 @@ async function scrapeAniwave(
     throw new Error(`Aniwave: episode list request failed for anime ${animeId}`);
   }
 
+  // Parse episode node ID for the requested episode number
+  // HTML: <li data-id="<nodeId>" data-num="<num>" ...>
   const epNodeIdMatch =
     new RegExp(`data-id="([^"]+)"[^>]*?data-num="${episodeNumber}"`).exec(listData.result) ||
     new RegExp(`data-num="${episodeNumber}"[^>]*?data-id="([^"]+)"`).exec(listData.result);
@@ -945,6 +1033,7 @@ async function scrapeAniwave(
 
   const episodeNodeId = epNodeIdMatch[1];
 
+  // 2. Fetch server list for this episode node
   const serversRes = await aniwaveFetch(
     `${ANIWAVE_BASE}/ajax/episode/servers/${episodeNodeId}`
   );
@@ -979,7 +1068,18 @@ async function scrapeAniwave(
   throw new Error(`Aniwave: all servers failed — ${errors.join("; ")}`);
 }
 
-// ─── 9anime ───────────────────────────────────────────────────────────────────
+// ─── 9anime ──────────────────────────────────────────────────────────────────
+//
+// 9anime.to uses the same __tad FingerprintJS challenge infrastructure as Aniwave.
+// Unlike Aniwave, 9anime's challenge routes through a11.click (an ad/router CDN)
+// rather than directly to a data CDN. tadFetch handles both cases.
+//
+// episodeId format: "<animeId>/<episodeNumber>"
+//   animeId — the alphanumeric ID in the 9anime URL, e.g. "r9w9" from
+//             https://9anime.to/watch/one-piece.r9w9
+//
+// With PROXY_URL set to a residential proxy, this works reliably.
+// Without a proxy, it will fail with a "datacenter IPs are blocked" error.
 
 const NINEANIME_BASE = "https://9anime.to";
 const NINEANIME_REFERER = `${NINEANIME_BASE}/`;
@@ -1001,6 +1101,10 @@ async function nineAnimeFetch(url: string, extra: Record<string, string> = {}) {
   return tadFetch(url, NINEANIME_BASE, nineAnimeHeaders(extra));
 }
 
+/**
+ * Parse 9anime episode list HTML to find the episode node ID for a given episode number.
+ * HTML: <li data-id="{nodeId}" data-num="{num}" ...>
+ */
 function parseNineAnimeEpisodeId(html: string, episodeNum: string): string | null {
   const re1 = new RegExp(`data-id="([^"]+)"[^>]*?data-num="${episodeNum}"`);
   const re2 = new RegExp(`data-num="${episodeNum}"[^>]*?data-id="([^"]+)"`);
@@ -1013,6 +1117,10 @@ interface NineAnimeServer {
   type: string;
 }
 
+/**
+ * Parse 9anime server list HTML.
+ * HTML: <li class="..." data-id="{serverId}" data-name="{name}" data-type="sub|dub">
+ */
 function parseNineAnimeServers(html: string, type: "sub" | "dub"): NineAnimeServer[] {
   const servers: NineAnimeServer[] = [];
   const re = /data-id="([^"]+)"[^>]*?data-name="([^"]*)"[^>]*?data-type="([^"]*)"/g;
@@ -1048,6 +1156,7 @@ async function scrape9Anime(
   const animeId = episodeId.slice(0, slashIdx);
   const episodeNum = episodeId.slice(slashIdx + 1);
 
+  // 1. Episode list
   const listRes = await nineAnimeFetch(`${NINEANIME_BASE}/ajax/episode/list/${animeId}`);
   const listData = (await listRes.json()) as { status?: string; result?: string };
   if (!listData.result) {
@@ -1059,6 +1168,7 @@ async function scrape9Anime(
     throw new Error(`9anime: episode ${episodeNum} not found for anime ${animeId}`);
   }
 
+  // 2. Server list
   const serversRes = await nineAnimeFetch(`${NINEANIME_BASE}/ajax/episode/servers/${episodeNodeId}`);
   const serversData = (await serversRes.json()) as { status?: string; result?: string };
   if (!serversData.result) {
@@ -1074,11 +1184,13 @@ async function scrape9Anime(
 
   for (const server of servers) {
     try {
+      // 3. Get embed URL for this server
       const srcRes = await nineAnimeFetch(`${NINEANIME_BASE}/ajax/server/${server.serverId}`);
       const srcData = (await srcRes.json()) as { status?: string; result?: { url?: string } };
       const embedUrl = srcData?.result?.url;
       if (!embedUrl) continue;
 
+      // 4. Dispatch to known embed providers
       let result: Awaited<ReturnType<typeof getMegacloudSources>> | null = null;
       let serverName = server.serverName || "unknown";
 
@@ -1098,6 +1210,7 @@ async function scrape9Anime(
         result = await getRapidCloudSources(idMatch[1], embedUrl);
         serverName = server.serverName || "rapidcloud";
       } else {
+        // Unknown embed — return as iframe
         return {
           url: embedUrl,
           type: "iframe",
@@ -1139,7 +1252,15 @@ async function scrape9Anime(
   throw new Error(`9anime: all servers failed — ${errors.join("; ")}`);
 }
 
-// ─── GogoAnime ────────────────────────────────────────────────────────────────
+// ─── GogoAnime (revived — gogoanime.gg) ──────────────────────────────────────
+//
+// gogoanime.gg is alive and uses the same __tad challenge infrastructure.
+// It hosts GogoCDN and VidStreaming embeds.
+//
+// episodeId format: "{animeSlug}/episode-{num}"
+//   e.g. "naruto/episode-220"  (the slug is the URL path segment on gogoanime.gg)
+//
+// Requires PROXY_URL set to a residential proxy to bypass CDN IP blocking.
 
 const GOGOANIME_BASE = "https://gogoanime.gg";
 const GOGOANIME_REFERER = `${GOGOANIME_BASE}/`;
@@ -1160,7 +1281,12 @@ async function gogoanimePageFetch(url: string, extra: Record<string, string> = {
   return tadFetch(url, GOGOANIME_BASE, gogoanimeHeaders(extra));
 }
 
+/**
+ * Parse GogoCDN or VidStreaming embed URL from GogoAnime episode page HTML.
+ * The page contains an iframe or a script tag with the streaming URL.
+ */
 function extractGogoanimeEmbed(html: string): string | null {
+  // Primary: <iframe src="..."> with gogoCDN / vidstreaming / mega
   const iframeMatch =
     html.match(/\bsrc="(https?:\/\/(?:[^"]*(?:gogocdn|vidstreaming|megacloud|mycloud|rapid-cloud)[^"]*))"/i) ||
     html.match(/\bdata-video="(https?:\/\/[^"]+)"/i) ||
@@ -1181,8 +1307,9 @@ async function scrapeGogoanime(
   }
 
   const animeSlug = episodeId.slice(0, slashIdx);
-  const episodePart = episodeId.slice(slashIdx + 1);
+  const episodePart = episodeId.slice(slashIdx + 1); // e.g. "episode-1"
 
+  // Fetch the episode page
   const pageUrl = `${GOGOANIME_BASE}/${animeSlug}-${episodePart}`;
   const pageRes = await gogoanimePageFetch(pageUrl);
   const html = await pageRes.text();
@@ -1194,6 +1321,7 @@ async function scrapeGogoanime(
     );
   }
 
+  // Dispatch to known embed providers
   if (embedUrl.includes("megacloud.tv")) {
     const idMatch =
       embedUrl.match(/\/e-1\/([^?/]+)/) ||
@@ -1252,6 +1380,7 @@ async function scrapeGogoanime(
     }
   }
 
+  // Unknown embed — return as iframe
   return {
     url: embedUrl,
     type: "iframe",
@@ -1263,10 +1392,28 @@ async function scrapeGogoanime(
   };
 }
 
+// ─── AnimePahe (bot-gated Kwik embeds — left as stub) ────────────────────────
+
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
+async function scrapeAnimepahe(
+  _episodeId: string,
+  _type: "sub" | "dub"
+): Promise<StreamResult> {
+  throw new Error(
+    "AnimePahe: server-side scraping is not supported — Kwik embed bot detection blocks automated requests"
+  );
+}
+
 // ─── Auto (waterfall) ─────────────────────────────────────────────────────────
 //
-// Tries all applicable sites in priority order (datacenter-friendly first).
-// Set PROXY_URL to a residential proxy to unlock Aniwave, 9anime, GogoAnime.
+// ID format routing:
+//   purely numeric          → HiAnime  (e.g. "12345")
+//   {alpha}/{num}           → AllAnime or Aniwave or 9anime  (e.g. "abc123/1")
+//   {alpha}/episode-{num}   → GogoAnime  (e.g. "naruto/episode-1")
+//
+// The waterfall tries all applicable sites in priority order and returns the
+// first success. Set PROXY_URL to a residential proxy to unlock Aniwave, 9anime,
+// and GogoAnime from datacenter environments.
 
 async function scrapeAuto(
   episodeId: string,
@@ -1277,6 +1424,7 @@ async function scrapeAuto(
   const isNumeric = /^\d+$/.test(episodeId);
   const isGogoFormat = hasSlash && /\/episode-\d+$/.test(episodeId);
 
+  // 1. AllAnime — {showId}/{episode} format (works from datacenter)
   if (hasSlash && !isGogoFormat) {
     try {
       return await scrapeAllanime(episodeId, type);
@@ -1285,6 +1433,7 @@ async function scrapeAuto(
     }
   }
 
+  // 2. HiAnime — purely numeric episode ID (works from datacenter)
   if (isNumeric) {
     try {
       return await scrapeHiAnime(episodeId, type);
@@ -1293,6 +1442,7 @@ async function scrapeAuto(
     }
   }
 
+  // 3. Aniwave — {animeId}/{episodeNumber} format (needs PROXY_URL for datacenter)
   if (hasSlash && !isGogoFormat) {
     try {
       return await scrapeAniwave(episodeId, type);
@@ -1301,6 +1451,7 @@ async function scrapeAuto(
     }
   }
 
+  // 4. 9anime — {animeId}/{episodeNumber} format (needs PROXY_URL for datacenter)
   if (hasSlash && !isGogoFormat) {
     try {
       return await scrape9Anime(episodeId, type);
@@ -1309,6 +1460,7 @@ async function scrapeAuto(
     }
   }
 
+  // 5. GogoAnime — {animeSlug}/episode-{num} format (needs PROXY_URL for datacenter)
   if (isGogoFormat) {
     try {
       return await scrapeGogoanime(episodeId, type);
@@ -1318,6 +1470,13 @@ async function scrapeAuto(
   }
 
   throw new Error(`Auto: all sites failed — ${JSON.stringify(errors)}`);
+}
+
+// ─── CORS helper ──────────────────────────────────────────────────────────────
+
+function setCors(res: import("express").Response) {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Headers", "*");
 }
 
 // ─── Proxy video request ──────────────────────────────────────────────────────
@@ -1346,21 +1505,18 @@ function proxyVideoRequest(
   const reqHeaders: Record<string, string> = {
     "User-Agent":
       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-    Referer: ref,
-    Origin: new URL(ref).origin,
-    Accept: "*/*",
+    "Referer": ref,
+    "Origin": new URL(ref).origin,
+    "Accept": "*/*",
     "Accept-Language": "en-US,en;q=0.9",
   };
+  // Forward Range header so Android WebView gets proper 206 Partial Content
   const range = req.headers["range"];
   if (range) reqHeaders["Range"] = Array.isArray(range) ? range[0] : range;
 
   const options = {
     hostname: targetUrl.hostname,
-    port: targetUrl.port
-      ? parseInt(targetUrl.port)
-      : targetUrl.protocol === "https:"
-      ? 443
-      : 80,
+    port: targetUrl.port ? parseInt(targetUrl.port) : (targetUrl.protocol === "https:" ? 443 : 80),
     path: targetUrl.pathname + targetUrl.search,
     method: "GET",
     headers: reqHeaders,
@@ -1369,49 +1525,46 @@ function proxyVideoRequest(
   const proxyReq = protocol.request(options, (proxyRes: IncomingMessage) => {
     const status = proxyRes.statusCode ?? 200;
 
+    // Follow redirects server-side (up to 5 hops).
+    // Using res.redirect() would send the Location to the browser which can't
+    // add the required Referer/UA headers on the follow-up request.
     if ([301, 302, 303, 307, 308].includes(status) && proxyRes.headers.location) {
       const location = proxyRes.headers.location;
-      proxyRes.resume();
+      proxyRes.resume(); // drain redirect body
       const nextUrl = location.startsWith("http")
         ? location
         : new URL(location, `${targetUrl.protocol}//${targetUrl.hostname}`).href;
+      // Strip Origin/Referer on cross-origin redirect to avoid 403
       const nextOptions = { ...options };
       try {
         const nextHost = new URL(nextUrl).hostname;
         if (nextHost !== targetUrl.hostname) {
-          const h = { ...(nextOptions.headers as Record<string, string>) };
-          delete h["Referer"];
-          delete h["Origin"];
+          const h = { ...(nextOptions.headers as Record<string,string>) };
+          delete h["Referer"]; delete h["Origin"];
           nextOptions.headers = h;
         }
-      } catch {
-        // ignore
-      }
+      } catch { /**/ }
+      // Recurse via a new request
       const nextTarget = new URL(nextUrl);
       const nextProtocol = nextTarget.protocol === "https:" ? https : http;
-      const nextReq = nextProtocol.request(
-        {
-          ...nextOptions,
-          hostname: nextTarget.hostname,
-          port: nextTarget.port || (nextTarget.protocol === "https:" ? 443 : 80),
-          path: nextTarget.pathname + nextTarget.search,
-        },
-        (nextRes: IncomingMessage) => {
-          if (!res.headersSent) {
-            res.writeHead(nextRes.statusCode ?? 200, {
-              "Content-Type": nextRes.headers["content-type"] ?? "video/mp4",
-              "Content-Length": nextRes.headers["content-length"] ?? "",
-              "Accept-Ranges": "bytes",
-              "Content-Range": nextRes.headers["content-range"] ?? "",
-              "Access-Control-Allow-Origin": "*",
-            });
-          }
-          nextRes.pipe(res);
+      const nextReq = nextProtocol.request({
+        ...nextOptions,
+        hostname: nextTarget.hostname,
+        port: nextTarget.port || (nextTarget.protocol === "https:" ? 443 : 80),
+        path: nextTarget.pathname + nextTarget.search,
+      }, (nextRes: IncomingMessage) => {
+        if (!res.headersSent) {
+          res.writeHead(nextRes.statusCode ?? 200, {
+            "Content-Type": nextRes.headers["content-type"] ?? "video/mp4",
+            "Content-Length": nextRes.headers["content-length"] ?? "",
+            "Accept-Ranges": "bytes",
+            "Content-Range": nextRes.headers["content-range"] ?? "",
+            "Access-Control-Allow-Origin": "*",
+          });
         }
-      );
-      nextReq.on("error", (e: Error) => {
-        if (!res.headersSent) res.status(502).json({ error: e.message });
+        nextRes.pipe(res);
       });
+      nextReq.on("error", (e: Error) => { if (!res.headersSent) res.status(502).json({ error: e.message }); });
       nextReq.end();
       return;
     }
@@ -1435,23 +1588,19 @@ function proxyVideoRequest(
   proxyReq.end();
 }
 
-// ─── Routes ───────────────────────────────────────────────────────────────────
+// ─── Route: GET /api/health ──────────────────────────────────────────────────
 
-// GET /api/proxy/status — shows proxy pool state
-router.get("/proxy/status", async (_req, res) => {
-  res.json({
-    poolSize: 0,
-    phoneProxy: !!process.env.CF_PROXY_URL,
-  });
+router.get("/health", (_req, res) => {
+  setCors(res);
+  res.json({ status: "ok" });
 });
 
-// GET /api/search?q=<query>&type=sub|dub
+// ─── Route: GET /api/search ───────────────────────────────────────────────────
+
 router.get("/search", async (req, res) => {
+  setCors(res);
   const { q, type } = req.query as { q?: string; type?: string };
-  if (!q) {
-    res.status(400).json({ success: false, error: "Missing required query param: q" });
-    return;
-  }
+  if (!q) { res.status(400).json({ success: false, error: "Missing required query param: q" }); return; }
   const streamType: "sub" | "dub" = type === "dub" ? "dub" : "sub";
   try {
     const results = await searchAllanime(q, streamType);
@@ -1461,13 +1610,71 @@ router.get("/search", async (req, res) => {
   }
 });
 
-// GET /api/proxy/video?url=<url>&referer=<referer>
+// ─── Route: GET /api/debug-sources ───────────────────────────────────────────
+
+router.get("/debug-sources", async (req, res) => {
+  setCors(res);
+  const { episodeId, type } = req.query as { episodeId?: string; type?: string };
+  if (!episodeId) { res.status(400).json({ error: "Missing episodeId" }); return; }
+  const streamType: "sub" | "dub" = type === "dub" ? "dub" : "sub";
+  const slashIdx = episodeId.indexOf("/");
+  const showId = episodeId.slice(0, slashIdx);
+  const episodeString = episodeId.slice(slashIdx + 1);
+
+  const data = await allanimeGraphql(AA_EPISODE_QUERY, { showId, translationType: streamType, episodeString });
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const sourceUrls = (data as any)?.data?.episode?.sourceUrls as AASourceUrl[] ?? [];
+
+  const results = await Promise.all(sourceUrls.map(async (src) => {
+    const out: Record<string, unknown> = {
+      sourceName: src.sourceName,
+      priority: src.priority,
+      type: src.type,
+      encoded: src.sourceUrl,
+    };
+    if (!src.sourceUrl || src.sourceUrl === "null") { out.status = "null/empty"; return out; }
+
+    let decoded = src.sourceUrl;
+    if (src.sourceUrl.startsWith("--")) {
+      const hex = src.sourceUrl.slice(2);
+      decoded = "";
+      for (let i = 0; i < hex.length - 1; i += 2) {
+        decoded += String.fromCharCode(parseInt(hex.slice(i, i + 2), 16) ^ 56);
+      }
+    }
+    out.decoded = decoded;
+
+    if (/^https?:\/\//.test(decoded)) {
+      try {
+        const r = await fetch(decoded, { headers: allanimeHeaders(), signal: AbortSignal.timeout(20000) });
+        out.vaultStatus = r.status;
+        if (r.ok) {
+          const body = await r.json() as Record<string, unknown>;
+          out.vaultBody = body;
+        }
+      } catch (e) {
+        out.vaultError = String(e);
+      }
+    }
+
+    return out;
+  }));
+
+  res.json({ results });
+});
+
+// ─── Route: GET /api/proxy/video ─────────────────────────────────────────────
+
 router.get("/proxy/video", (req, res) => {
+  setCors(res);
   proxyVideoRequest(req, res);
 });
 
-// GET /api/sources?episodeId=<id>&type=sub|dub&site=hianime|allanime|aniwave|9anime|gogoanime|auto
+// ─── Route: GET /api/sources ─────────────────────────────────────────────────
+
 router.get("/sources", async (req, res) => {
+  setCors(res);
+
   const { site, episodeId, type } = req.query as {
     site?: string;
     episodeId?: string;
